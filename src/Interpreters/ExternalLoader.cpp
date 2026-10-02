@@ -1,5 +1,6 @@
 #include <Interpreters/ExternalLoader.h>
 
+#include <chrono>
 #include <mutex>
 #include <unordered_set>
 #include <base/chrono_io.h>
@@ -109,6 +110,9 @@ public:
         auto * ptr = repository.get();
         repositories.emplace(ptr, RepositoryInfo{std::move(repository), {}});
         need_collect_object_configs = true;
+        /// Force the next `read()` to re-walk: a new repository may carry loadables
+        /// that the cached `object_configs` doesn't know about.
+        last_full_read_time = {};
     }
 
     void removeConfigRepository(Repository * repository)
@@ -119,6 +123,7 @@ public:
             return;
         repositories.erase(it);
         need_collect_object_configs = true;
+        last_full_read_time = {};
     }
 
     void setConfigSettings(const ExternalLoaderConfigSettings & settings_)
@@ -135,12 +140,31 @@ public:
 
     using ObjectConfigsPtr = std::shared_ptr<const ObjectConfigs>;
 
+    /// How long the result of a full repository walk stays valid before the next caller
+    /// is forced to re-walk. Walks are expensive (O(N_loadables) under the reader mutex)
+    /// and on multi-tenant catalogs with thousands of dictionaries the walk serializes
+    /// concurrent `SYSTEM RELOAD DICTIONARY` calls. The window must be short enough that
+    /// newly created/dropped loadables become visible within "human" time; 1 second is
+    /// the same order as the smallest dictionary LIFETIME we ever see in practice, so
+    /// nothing observable is broken by the cache.
+    static constexpr std::chrono::milliseconds READ_CACHE_VALIDITY{1000};
+
     /// Reads all repositories.
     ObjectConfigsPtr read()
     {
         std::lock_guard lock(mutex);
+        /// Fast path: if a previous caller did a full walk recently and nothing has
+        /// invalidated the cache (e.g. add/removeConfigRepository), return the cached
+        /// `object_configs`. Callers compare by pointer identity downstream
+        /// (`LoadingDispatcher::setConfiguration` short-circuits when the configs
+        /// pointer is unchanged), so reusing the same shared_ptr is what makes the
+        /// downstream dispatcher walk a no-op as well.
+        if (object_configs && !need_collect_object_configs
+            && (std::chrono::steady_clock::now() - last_full_read_time) < READ_CACHE_VALIDITY)
+            return object_configs;
         readRepositories();
         collectObjectConfigs();
+        last_full_read_time = std::chrono::steady_clock::now();
         return object_configs;
     }
 
@@ -151,6 +175,7 @@ public:
         std::lock_guard lock(mutex);
         readRepositories(repository_name);
         collectObjectConfigs();
+        last_full_read_time = std::chrono::steady_clock::now();
         return object_configs;
     }
 
@@ -384,6 +409,11 @@ private:
     std::unordered_map<Repository *, RepositoryInfo> repositories;
     ObjectConfigsPtr object_configs;
     bool need_collect_object_configs = false;
+    /// Last time `read()` performed a full walk of all repositories. The
+    /// `READ_CACHE_VALIDITY` window lets concurrent `SYSTEM RELOAD DICTIONARY`
+    /// calls reuse the cached `object_configs` instead of each walking the
+    /// repositories under this mutex.
+    std::chrono::steady_clock::time_point last_full_read_time{};
     size_t counter = 0;
 };
 
@@ -403,7 +433,20 @@ public:
     {
         std::unique_lock lock{mutex};
         infos.clear(); /// We clear this map to tell the threads that we don't want any load results anymore.
+        publishKnownNamesSnapshot();
         joinLoadingThreads(lock);
+    }
+
+    /// Rebuild the atomic snapshot of all known names so that `has()` can be
+    /// answered without ever acquiring `mutex`. Must be called while holding
+    /// `mutex` (to get a consistent view of `infos`).
+    void publishKnownNamesSnapshot()
+    {
+        auto snapshot = std::make_shared<std::unordered_set<String>>();
+        snapshot->reserve(infos.size());
+        for (const auto & [name, _] : infos)
+            snapshot->insert(name);
+        std::atomic_store_explicit(&known_names_snapshot, std::move(snapshot), std::memory_order_release);
     }
 
     void joinLoadingThreads()
@@ -513,6 +556,10 @@ public:
                 infos.erase(it);
             }
         }
+
+        /// Publish the updated name set so that `has()` can be answered
+        /// lock-free without blocking on `mutex`.
+        publishKnownNamesSnapshot();
 
         /// Maybe we have just added new objects which require to be loaded
         /// or maybe we have just removed object which were been loaded,
@@ -667,8 +714,7 @@ public:
 
     bool has(const String & name) const
     {
-        std::lock_guard lock{mutex};
-        return infos.contains(name);
+        return std::atomic_load_explicit(&known_names_snapshot, std::memory_order_acquire)->contains(name);
     }
 
     bool unload(const String & name)
@@ -1317,6 +1363,13 @@ private:
     std::condition_variable event;
     ObjectConfigsPtr configs;
     std::unordered_map<String, Info> infos;
+    /// Lock-free snapshot of infos keys, rebuilt by publishKnownNamesSnapshot
+    /// inside setConfiguration (while holding mutex). Lets has() answer
+    /// existence checks without ever acquiring mutex.
+    /// Accessed via std::atomic_load/store (the C++17 shared_ptr overloads)
+    /// because libc++ here doesn't expose std::atomic<shared_ptr<T>>.
+    mutable std::shared_ptr<std::unordered_set<String>> known_names_snapshot =
+        std::make_shared<std::unordered_set<String>>();
     bool always_load_everything = false;
     std::atomic<bool> enable_async_loading = false;
     std::unordered_map<size_t, ThreadFromGlobalPool> loading_threads;
