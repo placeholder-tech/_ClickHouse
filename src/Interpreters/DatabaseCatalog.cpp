@@ -1970,7 +1970,11 @@ void DatabaseCatalog::addDependencies(
         for (const auto & new_view_dependency : new_view_dependencies)
             view_dependencies.addDependency(StorageID{new_view_dependency}, StorageID{table_name});
     }
-    view_dependencies.log();
+    /// Note: previously this called `view_dependencies.log()` here. That call walks every node in
+    /// the graph and runs `getNodesSortedByLevel()` (a full O(N) topo sort). Because this function
+    /// is invoked once per CREATE TABLE / CREATE MV that has any dependencies, the per-CREATE work
+    /// grew with the total number of tables in the graph, turning sequences of CREATEs into O(N²).
+    /// The debug trace was not load-bearing; remove it from the hot path.
 }
 
 void DatabaseCatalog::addDependencies(
@@ -2115,6 +2119,15 @@ void DatabaseCatalog::checkTableCanBeAddedWithNoCyclicDependencies(
 
     auto check = [&](TablesDependencyGraph & dependencies, const TableNamesSet & new_dependencies)
     {
+        /// A cycle through table_id requires both an incoming and an outgoing edge incident on it.
+        /// We are about to add only outgoing edges; if the table currently has no dependents in the
+        /// graph (the common CREATE case — nothing references it yet because it didn't exist), no
+        /// cycle can form and the O(N) cycle scan is unnecessary. This matters for hot loops that
+        /// create many tables with dependencies (e.g. chained materialized views), where the prior
+        /// behavior produced O(N²) total work.
+        if (!dependencies.hasDependents(table_id))
+            return;
+
         auto old_dependencies = dependencies.removeDependencies(table_id);
         dependencies.addDependencies(table_name, new_dependencies);
         auto restore_dependencies = [&]()
@@ -2149,6 +2162,20 @@ void DatabaseCatalog::checkTableCanBeRenamedWithNoCyclicDependencies(const Stora
     auto check = [&](TablesDependencyGraph & dependencies)
     {
         auto old_dependencies = dependencies.removeDependencies(from_table_id);
+
+        /// `removeDependencies` returns the outgoing edges of `from`. The simulation below
+        /// re-adds them as `to`'s outgoing edges and runs a full O(V+E) cycle check on the
+        /// whole catalog graph. When `from` has no outgoing edges (the common case for hot
+        /// `CREATE OR REPLACE TABLE`, which renames a freshly-created intermediate table that
+        /// has no loading/referential dependencies of its own), no new edges are introduced
+        /// by the simulation and no new cycle can possibly form. Skip the full cycle scan.
+        /// Symmetrically, when neither `from`'s outgoing edges nor `to`'s incoming edges
+        /// could close a cycle, the check is also a no-op — but the empty-edges case is the
+        /// one that matters in practice on multi-tenant workloads with thousands of
+        /// `pp_<id>` databases, where each `RENAME` would otherwise spend O(N_tables) work.
+        if (old_dependencies.empty())
+            return;
+
         dependencies.addDependencies(to_table_id, old_dependencies);
         auto restore_dependencies = [&]()
         {
@@ -2183,6 +2210,16 @@ void DatabaseCatalog::checkTablesCanBeExchangedWithNoCyclicDependencies(const St
     {
         auto old_dependencies_1 = dependencies.removeDependencies(table_id_1);
         auto old_dependencies_2 = dependencies.removeDependencies(table_id_2);
+
+        /// Same reasoning as in `checkTableCanBeRenamedWithNoCyclicDependencies`: if neither
+        /// side has any outgoing edges to swap, the simulated graph is identical to the
+        /// original and no new cycle is possible. The full cycle scan is O(V+E) over the
+        /// whole catalog and dominates hot `REPLACE TABLE` / `EXCHANGE TABLES` workloads
+        /// against catalogs with many tables and databases. Restore the (no-op) mutation
+        /// trivially since both old-dependency vectors are empty.
+        if (old_dependencies_1.empty() && old_dependencies_2.empty())
+            return;
+
         dependencies.addDependencies(table_id_1, old_dependencies_2);
         dependencies.addDependencies(table_id_2, old_dependencies_1);
         auto restore_dependencies = [&]()
