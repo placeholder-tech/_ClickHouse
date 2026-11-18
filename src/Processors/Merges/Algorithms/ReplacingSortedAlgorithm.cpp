@@ -152,7 +152,7 @@ void ReplacingSortedAlgorithm::insertChunk(size_t source_num, Chunk chunk)
     if (out_row_sources_buf)
     {
         for (size_t i = 0; i < num_rows; ++i)
-            out_row_sources_buf->write(RowSourcePart(source_num, /*skip_flag=*/ mask && !(*mask)[i]).data);
+            RowSourcePart(source_num, /*skip_flag=*/ mask && !(*mask)[i]).write(*out_row_sources_buf);
     }
 
     if (!mask)

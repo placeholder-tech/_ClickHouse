@@ -15,6 +15,7 @@
 #include <Interpreters/TemporaryDataOnDisk.h>
 
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Processors/Executors/PullingAsyncPipelineExecutor.h>
 
 #include <QueryPipeline/QueryPipeline.h>
 
@@ -275,6 +276,7 @@ private:
         std::shared_ptr<MergedBlockOutputStream> to{nullptr};
         QueryPipeline merged_pipeline;
         std::unique_ptr<PullingPipelineExecutor> merging_executor;
+        std::unique_ptr<PullingAsyncPipelineExecutor> merging_async_executor;
 
         MergeTreeData::MutableDataPartPtr new_data_part{nullptr};
 
@@ -482,6 +484,8 @@ private:
         VerticalMergeStageSubtasks::const_iterator subtasks_iterator = subtasks.begin();
 
         void prepareVerticalMergeForOneColumn() const;
+        bool canGatherColumnsInParallel() const;
+        void gatherRemainingColumnsInParallel() const;
         bool executeVerticalMergeForOneColumn() const;
         void finalizeVerticalMergeForOneColumn() const;
 

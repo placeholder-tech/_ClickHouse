@@ -32,6 +32,9 @@
 #include <Processors/Merges/VersionedCollapsingTransform.h>
 #include <Processors/Transforms/ColumnGathererTransform.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Processors/Executors/PullingAsyncPipelineExecutor.h>
+#include <Common/ThreadPool.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <Interpreters/ProcessList.h>
 #include <Processors/QueryPlan/DistinctStep.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
@@ -102,6 +105,9 @@ namespace ProfileEvents
 namespace CurrentMetrics
 {
     extern const Metric TemporaryFilesForMerge;
+    extern const Metric OptimizeFinalThreads;
+    extern const Metric OptimizeFinalThreadsActive;
+    extern const Metric OptimizeFinalThreadsScheduled;
 }
 
 namespace DimensionalMetrics
@@ -146,6 +152,8 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool share_nested_offsets;
     extern const MergeTreeSettingsUInt64 vertical_merge_algorithm_min_bytes_to_activate;
     extern const MergeTreeSettingsUInt64 vertical_merge_algorithm_min_columns_to_activate;
+    extern const MergeTreeSettingsUInt64 vertical_merge_gather_threads;
+    extern const MergeTreeSettingsUInt64 merge_horizontal_stage_threads;
     extern const MergeTreeSettingsUInt64 vertical_merge_algorithm_min_rows_to_activate;
     extern const MergeTreeSettingsBool vertical_merge_remote_filesystem_prefetch;
     extern const MergeTreeSettingsBool materialize_skip_indexes_on_merge;
@@ -1898,7 +1906,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl() const
         /// in `finalize` reliably throws ABORTED even if SYSTEM START MERGES
         /// clears the blocker between these two reads.
         bool cancelled = ctx->is_cancelled();
-        if (cancelled || !global_ctx->merging_executor->pull(block))
+        if (cancelled || !(global_ctx->merging_async_executor ? global_ctx->merging_async_executor->pull(block) : global_ctx->merging_executor->pull(block)))
         {
             if (cancelled)
                 global_ctx->merge_list_element_ptr->is_cancelled.store(true, std::memory_order_relaxed);
@@ -1966,6 +1974,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalize() const
     finalizeProjections();
     global_ctx->to->finalizeIndexGranularity();
     global_ctx->merging_executor.reset();
+    global_ctx->merging_async_executor.reset();
     global_ctx->merged_pipeline.reset();
     ctx->build_statistics_transforms.clear();
 
@@ -1990,7 +1999,7 @@ bool MergeTask::VerticalMergeStage::prepareVerticalMergeForAllColumns() const
     global_ctx->merge_list_element_ptr->progress.store(ctx->column_sizes->keyColumnsWeight(), std::memory_order_relaxed);
 
     /// Ensure data has written to disk.
-    size_t rows_sources_count = ctx->rows_sources_temporary_file->finalizeWriting();
+    size_t rows_sources_count = ctx->rows_sources_temporary_file->finalizeWriting() / sizeof(RowSourcePart);
 
     /// In special case, when there is only one source part, and no rows were skipped, we may have
     /// skipped writing rows_sources file. Otherwise rows_sources_count must be equal to the total
@@ -2200,6 +2209,152 @@ MergeTask::VerticalMergeStage::createPipelineForReadingOneColumn(const String & 
     auto builder = merge_column_query_plan.buildQueryPipeline(optimization_settings, pipeline_settings);
 
     return {QueryPipelineBuilder::getPipeline(std::move(*builder)), std::move(indexes_to_recalc), std::move(column_build_statistics_transforms)};
+}
+
+
+/// SPIKE: gather several non-key columns concurrently. Every column only depends on the rows sources
+/// file written by the horizontal stage, so columns are independent until their results are
+/// registered in the new part, which is done under a mutex.
+bool MergeTask::VerticalMergeStage::canGatherColumnsInParallel() const
+{
+    if ((*global_ctx->data_settings)[MergeTreeSetting::vertical_merge_gather_threads] <= 1)
+        return false;
+    if (ctx->use_prefetch || ctx->prepared_pipeline)
+        return false;
+    /// Skip indexes share a packed writer with the horizontal writer; not handled by the spike.
+    if (global_ctx->metadata_snapshot->hasSecondaryIndices())
+        return false;
+    /// Nested columns share offsets streams between column writers; not handled by the spike.
+    for (auto it = ctx->it_name_and_type; it != global_ctx->gathering_columns.cend(); ++it)
+        if (it->name.contains('.'))
+            return false;
+    return true;
+}
+
+void MergeTask::VerticalMergeStage::gatherRemainingColumnsInParallel() const
+{
+    std::vector<NameAndTypePair> columns(ctx->it_name_and_type, global_ctx->gathering_columns.cend());
+    const size_t num_threads = std::min<size_t>((*global_ctx->data_settings)[MergeTreeSetting::vertical_merge_gather_threads], columns.size());
+    const Float64 progress_base = global_ctx->merge_list_element_ptr->progress.load(std::memory_order_relaxed);
+
+    std::mutex shared_state_mutex;
+    std::atomic<size_t> next_column{0};
+    std::atomic<bool> failed{false};
+
+    auto gather_one = [&](const NameAndTypePair & column)
+    {
+        VerticalMergeRuntimeContext::PreparedColumnPipeline prepared;
+        std::unique_ptr<MergedColumnOnlyOutputStream> column_to;
+        MergeStageProgress stage_progress(progress_base, ctx->column_sizes->columnWeight(column.name));
+        NamesAndTypesList columns_list = {column};
+
+        {
+            std::lock_guard lock(shared_state_mutex);
+            prepared = createPipelineForReadingOneColumn(column.name);
+            column_to = std::make_unique<MergedColumnOnlyOutputStream>(
+                global_ctx->new_data_part,
+                global_ctx->data_settings,
+                global_ctx->metadata_snapshot,
+                columns_list,
+                prepared.indexes_to_recalc,
+                global_ctx->compression_codec,
+                global_ctx->to->getIndexGranularity(),
+                global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed,
+                /*written_offset_substreams=*/ nullptr,
+                /*try_adaptive_codec=*/ !global_ctx->is_explicit_recompression,
+                global_ctx->to->getSkipIndicesPackedWriter());
+        }
+
+        prepared.pipeline.setProgressCallback(MergeProgressCallback(
+            global_ctx->merge_list_element_ptr,
+            global_ctx->watch_prev_elapsed,
+            stage_progress,
+            [&my_ctx = *global_ctx]() { my_ctx.checkOperationIsNotCanceled(); }));
+        prepared.pipeline.disableProfileEventUpdate();
+
+        size_t rows_written = 0;
+        {
+            PullingPipelineExecutor executor(prepared.pipeline);
+            Block block;
+            while (!failed.load(std::memory_order_relaxed) && !global_ctx->isCancelled() && executor.pull(block))
+            {
+                rows_written += block.rows();
+                column_to->write(block);
+            }
+        }
+
+        if (failed.load(std::memory_order_relaxed))
+            return;
+
+        {
+            std::lock_guard lock(shared_state_mutex);
+            global_ctx->checkOperationIsNotCanceled();
+
+            mergeBuiltStatistics(std::move(prepared.build_statistics_transforms), global_ctx);
+
+            column_to->finalizeIndexGranularity();
+            auto changed_checksums = column_to->fillChecksums(global_ctx->new_data_part, global_ctx->new_data_part->checksums);
+            global_ctx->gathered_data.checksums.add(std::move(changed_checksums));
+
+            const auto & columns_substreams = column_to->getColumnsSubstreams();
+            global_ctx->gathered_data.columns_substreams = ColumnsSubstreams::merge(global_ctx->gathered_data.columns_substreams, columns_substreams, global_ctx->new_data_part->getColumns().getNames());
+
+            auto cached_marks = column_to->releaseCachedMarks();
+            for (auto & [name, marks] : cached_marks)
+                global_ctx->cached_marks.emplace(name, std::move(marks));
+
+            auto cached_index_marks = column_to->releaseCachedIndexMarks();
+            for (auto & [name, marks] : cached_index_marks)
+                global_ctx->cached_index_marks.emplace(name, std::move(marks));
+
+            if (global_ctx->rows_written != rows_written)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Written {} elements of column {}, but {} rows of PK columns",
+                                toString(rows_written), column.name, toString(global_ctx->rows_written));
+
+            UInt64 rows = 0;
+            UInt64 bytes = 0;
+            prepared.pipeline.tryGetResultRowsAndBytes(rows, bytes);
+            global_ctx->merge_list_element_ptr->columns_written += 1;
+            global_ctx->merge_list_element_ptr->bytes_written_uncompressed += bytes;
+        }
+
+        column_to->finish(ctx->need_sync);
+    };
+
+    {
+        ThreadPool pool(
+            CurrentMetrics::OptimizeFinalThreads,
+            CurrentMetrics::OptimizeFinalThreadsActive,
+            CurrentMetrics::OptimizeFinalThreadsScheduled,
+            num_threads);
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::MERGE_MUTATE);
+
+        for (size_t thread = 0; thread < num_threads; ++thread)
+        {
+            runner.enqueueAndKeepTrack([&]
+            {
+                while (true)
+                {
+                    const size_t i = next_column.fetch_add(1);
+                    if (i >= columns.size() || failed.load(std::memory_order_relaxed))
+                        return;
+                    try
+                    {
+                        gather_one(columns[i]);
+                    }
+                    catch (...)
+                    {
+                        failed.store(true, std::memory_order_relaxed);
+                        throw;
+                    }
+                }
+            });
+        }
+        runner.waitForAllToFinishAndRethrowFirstError();
+    }
+
+    global_ctx->checkOperationIsNotCanceled();
+    ctx->it_name_and_type = global_ctx->gathering_columns.cend();
 }
 
 void MergeTask::VerticalMergeStage::prepareVerticalMergeForOneColumn() const
@@ -2788,6 +2943,12 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForAllColumns() const
     if (ctx->it_name_and_type == global_ctx->gathering_columns.end())
         return false;
 
+    if (ctx->vertical_merge_one_column_state == VerticalMergeRuntimeContext::State::NEED_PREPARE && canGatherColumnsInParallel())
+    {
+        gatherRemainingColumnsInParallel();
+        return false;
+    }
+
     switch (ctx->vertical_merge_one_column_state)
     {
         case VerticalMergeRuntimeContext::State::NEED_PREPARE:
@@ -2862,6 +3023,8 @@ void MergeTask::cancel() noexcept
 
     if (global_ctx->merging_executor)
         global_ctx->merging_executor->cancel();
+    if (global_ctx->merging_async_executor)
+        global_ctx->merging_async_executor->cancel();
 
     global_ctx->merged_pipeline.cancel();
 
@@ -3690,7 +3853,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
 
     /// Is calculated inside MergeProgressCallback.
     global_ctx->merged_pipeline.disableProfileEventUpdate();
-    global_ctx->merging_executor = std::make_unique<PullingPipelineExecutor>(global_ctx->merged_pipeline);
+    if (const size_t horizontal_threads = (*global_ctx->data_settings)[MergeTreeSetting::merge_horizontal_stage_threads]; horizontal_threads > 1)
+    {
+        global_ctx->merged_pipeline.setNumThreads(horizontal_threads);
+        global_ctx->merging_async_executor = std::make_unique<PullingAsyncPipelineExecutor>(global_ctx->merged_pipeline);
+    }
+    else
+        global_ctx->merging_executor = std::make_unique<PullingPipelineExecutor>(global_ctx->merged_pipeline);
 }
 
 

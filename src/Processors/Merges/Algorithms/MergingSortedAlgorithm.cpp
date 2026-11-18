@@ -447,7 +447,7 @@ void MergingSortedAlgorithm::insertRow(const SortCursorImpl & current)
         if (out_row_sources_buf)
         {
             RowSourcePart row_source(current.order, skipped);
-            out_row_sources_buf->write(row_source.data);
+            row_source.write(*out_row_sources_buf);
         }
     };
 
@@ -480,11 +480,11 @@ void MergingSortedAlgorithm::insertRows(const SortCursorImpl & current, size_t n
             if ((*mask)[i])
             {
                 merged_data.insertRow(current.all_columns, i, current.rows);
-                out_row_sources_buf->write(row_source.data);
+                row_source.write(*out_row_sources_buf);
             }
             else
             {
-                out_row_sources_buf->write(row_source_skipped.data);
+                row_source_skipped.write(*out_row_sources_buf);
             }
         }
     }
@@ -497,7 +497,7 @@ void MergingSortedAlgorithm::insertRows(const SortCursorImpl & current, size_t n
             RowSourcePart row_source(current.order);
 
             for (size_t i = 0; i < num_rows; ++i)
-                out_row_sources_buf->write(row_source.data);
+                row_source.write(*out_row_sources_buf);
         }
     }
 }
@@ -519,7 +519,7 @@ void MergingSortedAlgorithm::insertChunk(size_t source_num)
             RowSourcePart row_source_skipped(source_num, true);
 
             for (size_t i = 0; i < chunk_num_rows; ++i)
-                out_row_sources_buf->write((*mask)[i] ? row_source.data : row_source_skipped.data);
+                ((*mask)[i] ? row_source : row_source_skipped).write(*out_row_sources_buf);
         }
 
         for (auto & column : columns)
@@ -536,7 +536,7 @@ void MergingSortedAlgorithm::insertChunk(size_t source_num)
         {
             RowSourcePart row_source(source_num);
             for (size_t i = 0; i < chunk_num_rows; ++i)
-                out_row_sources_buf->write(row_source.data);
+                row_source.write(*out_row_sources_buf);
         }
 
         merged_data.insertChunk(std::move(chunk), chunk_num_rows);

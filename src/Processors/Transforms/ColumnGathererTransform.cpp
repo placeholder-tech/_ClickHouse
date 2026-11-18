@@ -28,6 +28,18 @@ void ColumnGathererStream::Source::update(ColumnPtr column_)
     column = std::move(column_);
     size = column->size();
     pos = 0;
+    sparse = typeid_cast<const ColumnSparse *>(column.get());
+    sparse_cursor = 0;
+}
+
+void ColumnGathererStream::insertIntoSparse(ColumnSparse & column_res, Source & source, size_t len)
+{
+    if (source.sparse)
+        column_res.insertRangeFromSparseWithCursor(*source.sparse, source.pos, len, source.sparse_cursor);
+    else if (len == 1)
+        column_res.insertFrom(*source.column, source.pos);
+    else
+        column_res.insertRangeFrom(*source.column, source.pos, len);
 }
 
 ColumnGathererStream::ColumnGathererStream(

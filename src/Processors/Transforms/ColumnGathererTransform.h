@@ -1,6 +1,8 @@
 #pragma once
 
 #include <IO/ReadBuffer.h>
+#include <IO/WriteBuffer.h>
+#include <Common/Exception.h>
 #include <Common/PODArray.h>
 #include <Processors/Merges/Algorithms/IMergingAlgorithm.h>
 #include <Processors/Merges/IMergingTransform.h>
@@ -11,17 +13,25 @@ namespace Poco { class Logger; }
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+class ColumnSparse;
+
 
 /// Tiny struct, stores number of a Part from which current row was fetched, and insertion flag.
 struct RowSourcePart
 {
-    UInt8 data = 0;
+    /// SPIKE: widened from UInt8 so that vertical merges are not limited to 127 source parts.
+    UInt16 data = 0;
 
     RowSourcePart() = default;
 
     explicit RowSourcePart(size_t source_num, bool skip_flag = false)
     {
-        static_assert(sizeof(*this) == 1, "Size of RowSourcePart is too big due to compiler settings");
+        static_assert(sizeof(*this) == 2, "Size of RowSourcePart is too big due to compiler settings");
         setSourceNum(source_num);
         setSkipFlag(skip_flag);
     }
@@ -33,17 +43,19 @@ struct RowSourcePart
 
     void setSourceNum(size_t source_num)
     {
-        data = (data & MASK_FLAG) | (static_cast<UInt8>(source_num) & MASK_NUMBER);
+        data = (data & MASK_FLAG) | (static_cast<UInt16>(source_num) & MASK_NUMBER);
     }
 
     void setSkipFlag(bool flag)
     {
-        data = flag ? data | MASK_FLAG : data & ~MASK_FLAG;
+        data = static_cast<UInt16>(flag ? data | MASK_FLAG : data & ~MASK_FLAG);
     }
 
-    static constexpr size_t MAX_PARTS = 0x7F;
-    static constexpr UInt8 MASK_NUMBER = 0x7F;
-    static constexpr UInt8 MASK_FLAG = 0x80;
+    void write(WriteBuffer & buf) const { buf.write(reinterpret_cast<const char *>(&data), sizeof(data)); }
+
+    static constexpr size_t MAX_PARTS = 0x7FFF;
+    static constexpr UInt16 MASK_NUMBER = 0x7FFF;
+    static constexpr UInt16 MASK_FLAG = 0x8000;
 };
 
 using MergedRowSources = PODArray<RowSourcePart>;
@@ -84,9 +96,15 @@ private:
         ColumnPtr column;
         size_t pos = 0;
         size_t size = 0;
+        /// SPIKE: set when the source column is sparse; cursor into its offsets for sequential access.
+        const ColumnSparse * sparse = nullptr;
+        size_t sparse_cursor = 0;
 
         void update(ColumnPtr column_);
     };
+
+    /// SPIKE: sequential insertion into a sparse result without per-row binary search.
+    void insertIntoSparse(ColumnSparse & column_res, Source & source, size_t len);
 
     MutableColumnPtr result_column;
 
@@ -132,6 +150,8 @@ template <typename Column>
 void ColumnGathererStream::gather(Column & column_res)
 {
     row_sources_buf.nextIfAtEnd();
+    if ((row_sources_buf.buffer().end() - row_sources_buf.position()) % sizeof(RowSourcePart) != 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Rows sources buffer is not aligned to the size of RowSourcePart");
     RowSourcePart * row_source_pos = reinterpret_cast<RowSourcePart *>(row_sources_buf.position());
     RowSourcePart * row_sources_end = reinterpret_cast<RowSourcePart *>(row_sources_buf.buffer().end());
 
@@ -148,6 +168,8 @@ void ColumnGathererStream::gather(Column & column_res)
 
     /// We use do ... while here to ensure there will be at least one iteration of this loop.
     /// Because the column_res.byteSize() could be bigger than block_preferred_size_bytes already at this point.
+    /// SPIKE: byteSize() is a virtual call (several for nested columns); check it once per 16 iterations.
+    size_t iteration = 0;
     do
     {
         if (row_source_pos >= row_sources_end)
@@ -188,14 +210,16 @@ void ColumnGathererStream::gather(Column & column_res)
                 source_to_fully_copy = &source;
                 return;
             }
-            if (len == 1)
+            if constexpr (std::is_same_v<Column, ColumnSparse>)
+                insertIntoSparse(column_res, source, len);
+            else if (len == 1)
                 column_res.insertFrom(*source.column, source.pos);
             else
                 column_res.insertRangeFrom(*source.column, source.pos, len);
         }
 
         source.pos += len;
-    } while (column_res.size() < block_preferred_size_rows && column_res.byteSize() < block_preferred_size_bytes);
+    } while (column_res.size() < block_preferred_size_rows && ((++iteration & 15) != 0 || column_res.byteSize() < block_preferred_size_bytes));
 }
 
 }
