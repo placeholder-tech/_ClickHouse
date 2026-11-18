@@ -1997,6 +1997,14 @@ Vertical merge algorithm.
     DECLARE(UInt64, vertical_merge_algorithm_min_columns_to_activate, 11, R"(
 Minimal amount of non-PK columns to activate Vertical merge algorithm.
 )", 0) \
+    DECLARE(UInt64, vertical_merge_gather_threads, 1, R"(
+SPIKE. Number of threads that gather non-key columns concurrently in the vertical stage of a merge. 1 keeps the sequential behaviour.
+)", EXPERIMENTAL, \
+        {"26.10", 1, 1, "New setting."}) \
+    DECLARE(UInt64, merge_horizontal_stage_threads, 1, R"(
+SPIKE. Number of pipeline threads used by the horizontal (key merging) stage of a merge. 1 keeps the single-threaded pulling executor.
+)", EXPERIMENTAL, \
+        {"26.10", 1, 1, "New setting."}) \
     DECLARE(Bool, vertical_merge_remote_filesystem_prefetch, true, R"(
 If true prefetching of data from remote filesystem is used for the next
 column during merge

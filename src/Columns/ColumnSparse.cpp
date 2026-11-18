@@ -945,6 +945,34 @@ IColumn::Offsets & ColumnSparse::getOffsetsData()
     return assert_cast<ColumnUInt64 &>(*offsets).getData();
 }
 
+void ColumnSparse::insertRangeFromSparseWithCursor(const ColumnSparse & src, size_t start, size_t length, size_t & cursor)
+{
+    const auto & src_offsets = src.getOffsetsData();
+    const size_t num_offsets = src_offsets.size();
+
+    while (cursor < num_offsets && src_offsets[cursor] < start)
+        ++cursor;
+
+    const size_t end = start + length;
+    const size_t first = cursor;
+    if (cursor < num_offsets && src_offsets[cursor] < end)
+    {
+        auto & offsets_data = getOffsetsData();
+        do
+        {
+            offsets_data.push_back(_size + (src_offsets[cursor] - start));
+            ++cursor;
+        } while (cursor < num_offsets && src_offsets[cursor] < end);
+
+        if (cursor - first == 1)
+            values->insertFrom(src.getValuesColumn(), first + 1);
+        else
+            values->insertRangeFrom(src.getValuesColumn(), first + 1, cursor - first);
+    }
+
+    _size += length;
+}
+
 size_t ColumnSparse::getValueIndex(size_t n) const
 {
     chassert(n < _size);

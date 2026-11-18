@@ -187,6 +187,10 @@ public:
     /// O(log(offsets.size())) complexity,
     size_t getValueIndex(size_t n) const;
 
+    /// SPIKE: like insertRangeFrom for a sparse source, but without binary searches. `cursor` is a position in the
+    /// offsets of `src` that the caller keeps between calls; `start` must not decrease between calls for the same `src`.
+    void insertRangeFromSparseWithCursor(const ColumnSparse & src, size_t start, size_t length, size_t & cursor);
+
     const IColumn & getValuesColumn() const { return *values; }
     IColumn & getValuesColumn() { return *values; }
 
